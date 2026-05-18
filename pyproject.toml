@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ecoframe"
+version = "0.1.0"
+description = "Standard brain/environment protocol for persistent-state AI agents"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+nats = ["nats-py>=2.3"]
+redis = ["redis>=5.0"]
+zmq = ["pyzmq>=25.0"]
+dev = ["pytest>=7.0", "pytest-asyncio>=0.21"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ecoframe"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
