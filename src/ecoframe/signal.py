@@ -105,6 +105,7 @@ class EnvironmentSignal(Signal):
         'curiosity':     'mean brain CE EMA — how much brains are learning here',
         'load_fraction': 'current_agents / capacity',
         'difficulty':    'current config_head difficulty dial [0, 1]',
+        'memory_gb':     'GPU memory occupied by this env (0 for CPU envs)',
     }
 
     curiosity:     float = 0.0
@@ -113,3 +114,7 @@ class EnvironmentSignal(Signal):
     address:       str   = ""    # host:port to connect (EnvironmentProxy)
     env_type:      str   = ""    # "metadrive_roundabout", "navsim", etc.
     manifest_hash: str   = ""    # SensorManifest.hash — brain checks compatibility
+    # Hardware fields — populated from HardwareSpec, used for hardware-aware routing
+    device_type:   str   = "cpu" # "cpu" | "cuda" | "mps"
+    device_id:     int   = 0
+    memory_gb:     float = 0.0

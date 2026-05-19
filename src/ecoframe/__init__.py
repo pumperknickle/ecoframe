@@ -13,7 +13,7 @@ Quick start:
 from ecoframe.protocol import (
     SensorBundle, ActionBundle, Session,
     SensorSpec, SensorManifest, TrainingMetrics,
-    LossHandle,
+    LossHandle, HardwareSpec,
     EnvironmentProtocol, BrainProtocol,
     CapacityError, ManifestMismatchError,
 )
@@ -26,7 +26,7 @@ __version__ = "0.1.0"
 __all__ = [
     "SensorBundle", "ActionBundle", "Session",
     "SensorSpec", "SensorManifest", "TrainingMetrics",
-    "LossHandle",
+    "LossHandle", "HardwareSpec",
     "EnvironmentProtocol", "BrainProtocol",
     "CapacityError", "ManifestMismatchError",
     "Signal", "CuriositySignal", "EnvironmentSignal",

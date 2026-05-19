@@ -87,6 +87,54 @@ class SensorManifest:
         return hashlib.sha1(json.dumps(spec).encode()).hexdigest()[:12]
 
 
+# ── Hardware declaration ───────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class HardwareSpec:
+    """
+    Hardware requirements for one environment instance.
+
+    Published in EnvironmentSignal so brains navigate only to reachable envs.
+    Used by ecoframe-runtime's DeviceContext to enforce CUDA isolation.
+
+    This is data only — no OS calls, no CUDA imports. The runtime library
+    reads HardwareSpec and performs the actual device management.
+    """
+    device_type:   str   = "cpu"   # "cpu" | "cuda" | "mps"
+    device_id:     int   = 0       # GPU device index (ignored for cpu)
+    memory_gb:     float = 0.0     # GPU memory required
+    n_cpu_workers: int   = 1       # CPU cores for subprocess workers
+    accelerator:   str   = ""      # "panda3d" | "isaac_gym" | "brax_jax" | ""
+
+    def is_compatible_with(self, other: 'HardwareSpec') -> bool:
+        """
+        True if these two specs can run simultaneously without CUDA conflict.
+
+        CPU envs never conflict with anything.
+        CUDA envs conflict only if they share a device_id.
+        """
+        if self.device_type == "cpu" or other.device_type == "cpu":
+            return True
+        return self.device_id != other.device_id
+
+    def cuda_visible_devices(self) -> str:
+        """Value to set CUDA_VISIBLE_DEVICES to for this spec."""
+        if self.device_type == "cpu":
+            return ""
+        return str(self.device_id)
+
+    @classmethod
+    def cpu(cls, n_workers: int = 1, accelerator: str = "") -> 'HardwareSpec':
+        return cls(device_type="cpu", n_cpu_workers=n_workers,
+                   accelerator=accelerator)
+
+    @classmethod
+    def cuda(cls, device_id: int = 0, memory_gb: float = 4.0,
+             accelerator: str = "") -> 'HardwareSpec':
+        return cls(device_type="cuda", device_id=device_id,
+                   memory_gb=memory_gb, accelerator=accelerator)
+
+
 # ── Universal data types ───────────────────────────────────────────────────────
 
 @dataclass
@@ -198,9 +246,10 @@ class EnvironmentProtocol(Protocol):
       metrics = brain.backward(loss)                 # backward overlaps env step
       new_obs = env.step_wait()                      # collect when GPU done
     """
-    env_id:   str
-    capacity: int
-    manifest: SensorManifest
+    env_id:        str
+    capacity:      int
+    manifest:      SensorManifest
+    hardware_spec: HardwareSpec     # what hardware this env occupies
 
     def start(self) -> None: ...
     def close(self) -> None: ...
