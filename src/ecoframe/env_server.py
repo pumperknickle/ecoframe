@@ -1,25 +1,27 @@
 """
 Phase 4: EnvironmentServer — exposes any EnvironmentProtocol over the network.
 
-Pairs with EnvironmentProxy: brain can't tell local from remote.
-Transport is swappable (ZMQ, gRPC, shared memory).
+Transport: ZMQ with two socket pairs:
+  - Control socket (REQ/REP): enter, exit, reset, manifest, close
+  - Async socket (PUSH/PULL pair): step_async sends actions (PUSH),
+    step_wait receives observations (PULL from server's PUSH)
 
-Default transport: ZMQ REQ/REP (simple, no broker needed, works across machines).
-ZMQ is an optional dependency: pip install ecoframe[zmq]
+This provides genuine overlap: client sends actions, does GPU compute,
+then collects observations. Server steps the environment concurrently.
 
-Wire format: msgpack (fast, cross-language, handles numpy arrays).
+Wire format: msgpack with numpy + pickle fallback for complex objects.
 
 Usage:
-    # On GPU 1 (environment machine):
-    env = MetaDriveEnvironment(...)
-    server = EnvironmentServer(env, port=5555)
-    server.serve_forever()   # blocks
+    # Environment machine (GPU 1):
+    server = EnvironmentServer(env, ctrl_port=5555, obs_port=5556)
+    server.serve_forever()
 
-    # On GPU 0 (brain machine):
-    proxy = EnvironmentProxy("tcp://gpu1:5555")
-    session = proxy.enter("brain0", ssm_state={})
-    proxy.step_async(actions)
-    obs = proxy.step_wait()
+    # Brain machine (GPU 0):
+    proxy = EnvironmentProxy("tcp://gpu1", ctrl_port=5555, obs_port=5556)
+    session = proxy.enter("brain0")
+    proxy.step_async(actions)      # non-blocking: sends to server
+    # ... GPU forward+backward here ...
+    obs = proxy.step_wait()        # collect when ready
 """
 from __future__ import annotations
 
@@ -34,33 +36,83 @@ from ecoframe.protocol import (
 
 class EnvironmentServer:
     """
-    Wraps any EnvironmentProtocol and serves it over ZMQ REP socket.
+    Serves any EnvironmentProtocol over ZMQ.
 
-    Thread-safe: requests are serialized by the ZMQ event loop.
+    Two socket channels:
+      ctrl_port: REQ/REP for enter/exit/manifest (infrequent, synchronous)
+      obs_port:  PUSH (server→client) + action_port PULL (client→server)
+                 for async step_async/step_wait
     """
 
     def __init__(
         self,
-        env:        EnvironmentProtocol,
-        port:       int  = 5555,
-        transport:  str  = 'zmq',
-        verbose:    bool = False,
+        env:          EnvironmentProtocol,
+        ctrl_port:    int  = 5555,
+        obs_port:     int  = 5556,
+        action_port:  int  = 5557,
+        verbose:      bool = False,
     ):
-        self._env       = env
-        self._port      = port
-        self._transport = transport
-        self._verbose   = verbose
-        self._running   = False
+        self._env         = env
+        self._ctrl_port   = ctrl_port
+        self._obs_port    = obs_port
+        self._action_port = action_port
+        self._verbose     = verbose
+        self._running     = False
 
     def serve_forever(self) -> None:
-        """Block and serve requests. Call in a thread or separate process."""
-        if self._transport == 'zmq':
-            self._serve_zmq()
-        else:
-            raise ValueError(f"Unknown transport: {self._transport!r}")
+        try:
+            import zmq
+        except ImportError:
+            raise ImportError("zmq required: pip install ecoframe[zmq]")
+
+        ctx = zmq.Context()
+
+        # Control: synchronous REQ/REP
+        ctrl = ctx.socket(zmq.REP)
+        ctrl.bind(f"tcp://*:{self._ctrl_port}")
+
+        # Async step: server pulls actions, pushes observations
+        action_pull = ctx.socket(zmq.PULL)
+        action_pull.bind(f"tcp://*:{self._action_port}")
+
+        obs_push = ctx.socket(zmq.PUSH)
+        obs_push.bind(f"tcp://*:{self._obs_port}")
+
+        self._running = True
+        if self._verbose:
+            print(f"EnvironmentServer: ctrl={self._ctrl_port} "
+                  f"obs={self._obs_port} action={self._action_port}", flush=True)
+
+        poller = zmq.Poller()
+        poller.register(ctrl, zmq.POLLIN)
+        poller.register(action_pull, zmq.POLLIN)
+
+        while self._running:
+            ready = dict(poller.poll(timeout=100))
+
+            if ctrl in ready:
+                raw = ctrl.recv()
+                req = _deserialize(raw)
+                rep = self._dispatch_ctrl(req)
+                ctrl.send(_serialize(rep))
+
+            if action_pull in ready:
+                raw     = action_pull.recv()
+                req     = _deserialize(raw)
+                actions = {k: _dict_to_action(v)
+                           for k, v in req.get('actions', {}).items()}
+                self._env.step_async(actions)
+                bundles = self._env.step_wait()
+                obs_push.send(_serialize(
+                    {'bundles': {k: _bundle_to_dict(b)
+                                 for k, b in bundles.items()}}))
+
+        ctrl.close()
+        action_pull.close()
+        obs_push.close()
+        ctx.term()
 
     def serve_background(self) -> threading.Thread:
-        """Start server in a daemon thread. Returns the thread."""
         t = threading.Thread(target=self.serve_forever, daemon=True)
         t.start()
         return t
@@ -68,74 +120,30 @@ class EnvironmentServer:
     def stop(self) -> None:
         self._running = False
 
-    # ── ZMQ transport ─────────────────────────────────────────────────────────
-
-    def _serve_zmq(self) -> None:
-        try:
-            import zmq
-        except ImportError:
-            raise ImportError("zmq required: pip install ecoframe[zmq]")
-
-        ctx    = zmq.Context()
-        socket = ctx.socket(zmq.REP)
-        socket.bind(f"tcp://*:{self._port}")
-        self._running = True
-
-        if self._verbose:
-            print(f"EnvironmentServer listening on port {self._port}", flush=True)
-
-        while self._running:
-            try:
-                if not socket.poll(timeout=100):   # 100ms timeout for stop check
-                    continue
-                raw = socket.recv()
-                req = _deserialize(raw)
-                rep = self._dispatch(req)
-                socket.send(_serialize(rep))
-            except Exception as e:
-                socket.send(_serialize({'error': str(e)}))
-
-        socket.close()
-        ctx.term()
-
-    def _dispatch(self, req: dict) -> dict:
+    def _dispatch_ctrl(self, req: dict) -> dict:
         method = req.get('method')
         args   = req.get('args', {})
 
         if method == 'manifest':
             return {'manifest': _manifest_to_dict(self._env.manifest)}
-
         elif method == 'enter':
             session = self._env.enter(args['brain_id'], args.get('ssm_state'))
             return {'session': _session_to_dict(session)}
-
         elif method == 'exit':
             state = self._env.exit(_dict_to_session(args['session']))
             return {'ssm_state': state}
-
-        elif method == 'step_async':
-            actions = {k: _dict_to_action(v) for k, v in args['actions'].items()}
-            self._env.step_async(actions)
-            return {'ok': True}
-
-        elif method == 'step_wait':
-            bundles = self._env.step_wait()
-            return {'bundles': {k: _bundle_to_dict(b) for k, b in bundles.items()}}
-
         elif method == 'reset':
             bundles = self._env.reset(_dict_to_session(args['session']))
             return {'bundles': {k: _bundle_to_dict(b) for k, b in bundles.items()}}
-
         elif method == 'close':
             self._env.close()
             self._running = False
             return {'ok': True}
-
         else:
             return {'error': f"Unknown method: {method!r}"}
 
 
-# ── Serialization helpers ──────────────────────────────────────────────────────
+# ── Serialization ──────────────────────────────────────────────────────────────
 
 def _serialize(obj: Any) -> bytes:
     try:
@@ -145,21 +153,47 @@ def _serialize(obj: Any) -> bytes:
             if isinstance(x, np.ndarray):
                 return {'__ndarray__': True, 'data': x.tobytes(),
                         'dtype': str(x.dtype), 'shape': list(x.shape)}
-            raise TypeError(type(x))
+            # Torch tensors: convert to numpy first
+            try:
+                import torch
+                if isinstance(x, torch.Tensor):
+                    arr = x.detach().cpu().numpy()
+                    return {'__ndarray__': True, '__torch__': True,
+                            'data': arr.tobytes(), 'dtype': str(arr.dtype),
+                            'shape': list(arr.shape)}
+            except ImportError:
+                pass
+            raise TypeError(f"Cannot serialize type {type(x)}")
         return msgpack.packb(obj, default=_enc, use_bin_type=True)
-    except ImportError:
+    except (ImportError, TypeError):
+        # Fallback: pickle handles anything including torch tensors
         import pickle
-        return pickle.dumps(obj)
+        return b'\x00' + pickle.dumps(obj)  # prefix byte distinguishes from msgpack
 
 
 def _deserialize(data: bytes) -> Any:
+    if data[:1] == b'\x00':
+        import pickle
+        return pickle.loads(data[1:])
     try:
         import msgpack
         import numpy as np
         def _dec(obj):
-            if '__ndarray__' in obj:
-                arr = np.frombuffer(obj['data'], dtype=obj['dtype'])
-                return arr.reshape(obj['shape'])
+            if b'__ndarray__' in obj or '__ndarray__' in obj:
+                key = b'__ndarray__' if b'__ndarray__' in obj else '__ndarray__'
+                dt_key  = b'dtype'  if b'dtype'  in obj else 'dtype'
+                shp_key = b'shape'  if b'shape'  in obj else 'shape'
+                dat_key = b'data'   if b'data'   in obj else 'data'
+                torch_key = b'__torch__' if b'__torch__' in obj else '__torch__'
+                arr = np.frombuffer(obj[dat_key],
+                                    dtype=np.dtype(obj[dt_key])).reshape(obj[shp_key])
+                if torch_key in obj and obj[torch_key]:
+                    try:
+                        import torch
+                        return torch.from_numpy(arr.copy())
+                    except ImportError:
+                        pass
+                return arr
             return obj
         return msgpack.unpackb(data, object_hook=_dec, raw=False)
     except ImportError:
@@ -169,7 +203,7 @@ def _deserialize(data: bytes) -> Any:
 
 def _manifest_to_dict(m: SensorManifest) -> dict:
     return {
-        'env_id':  m.env_id,
+        'env_id': m.env_id,
         'sensors': [
             {'name': s.name, 'shape': list(s.shape), 'dtype': s.dtype,
              'action_affected': s.action_affected,
@@ -208,12 +242,12 @@ def _dict_to_session(d: dict) -> Session:
 
 
 def _bundle_to_dict(b: SensorBundle) -> dict:
-    import numpy as np
     return {
         'visual':         b.visual,
         'audio':          b.audio,
         'text_tokens':    b.text_tokens,
         'proprioceptive': b.proprioceptive,
+        'extra':          b.extra,
         'reward':         b.reward,
         'done':           b.done,
         'env_id':         b.env_id,
@@ -228,6 +262,7 @@ def _dict_to_bundle(d: dict) -> SensorBundle:
         audio          = d.get('audio'),
         text_tokens    = d.get('text_tokens'),
         proprioceptive = d.get('proprioceptive'),
+        extra          = d.get('extra') or {},
         reward         = d.get('reward', 0.0),
         done           = d.get('done', False),
         env_id         = d.get('env_id', ''),

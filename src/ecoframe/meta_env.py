@@ -194,17 +194,14 @@ class MetaEnvironment:
             ], dtype=np.float32)
 
             bundles[brain_id] = SensorBundle(
-                visual         = None,
                 proprioceptive = self_state,
+                extra          = {'env_field': field_obs},   # manifest-declared sensor
                 reward         = 0.0,
                 done           = False,
                 env_id         = self.env_id,
                 agent_id       = brain_id,
                 step           = self._step_count,
-                info           = {
-                    'env_field':   field_obs,
-                    'env_signals': env_sigs,
-                },
+                info           = {'env_signals': env_sigs},  # non-sensor metadata
             )
 
         self._pending_actions = {}

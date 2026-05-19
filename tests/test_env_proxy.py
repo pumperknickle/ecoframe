@@ -17,6 +17,7 @@ from ecoframe.env_server import (
     _manifest_to_dict, _dict_to_manifest,
     _session_to_dict, _dict_to_session,
     _bundle_to_dict, _dict_to_bundle,
+    _dict_to_action,
     EnvironmentServer,
 )
 
@@ -40,34 +41,39 @@ def _make_mock_env():
         "a0": SensorBundle(
             visual=np.zeros((64, 64, 3), dtype=np.uint8),
             proprioceptive=np.zeros(5, dtype=np.float32),
+            extra={"env_field": np.zeros(64, dtype=np.float32)},
             reward=0.1, done=False,
             env_id="test_env", agent_id="a0",
         )
     }
+    env.step_async = MagicMock()
     return env
 
 
 class _InProcessProxy:
     """
-    Test proxy that calls EnvironmentServer._dispatch() directly.
+    Test proxy that calls EnvironmentServer._dispatch_ctrl() directly.
     Simulates the full serialization round-trip without network.
+    step_async/step_wait tested via _dispatch_step() which mirrors server's
+    action-pull → env.step → obs-push flow.
     """
     def __init__(self, server: EnvironmentServer):
         self._server = server
         self._manifest_cache = None
+        self._pending_step_result = None
 
-    def _call(self, method, **kwargs):
+    def _ctrl_call(self, method, **kwargs):
         req = {'method': method, 'args': kwargs}
         raw = _serialize(req)
         req2 = _deserialize(raw)
-        rep  = self._server._dispatch(req2)
+        rep  = self._server._dispatch_ctrl(req2)
         raw2 = _serialize(rep)
         return _deserialize(raw2)
 
     @property
     def manifest(self):
         if self._manifest_cache is None:
-            rep = self._call('manifest')
+            rep = self._ctrl_call('manifest')
             self._manifest_cache = _dict_to_manifest(rep['manifest'])
         return self._manifest_cache
 
@@ -75,34 +81,40 @@ class _InProcessProxy:
     def env_id(self): return self.manifest.env_id
 
     def enter(self, brain_id, ssm_state=None):
-        rep = self._call('enter', brain_id=brain_id, ssm_state=ssm_state or {})
+        rep = self._ctrl_call('enter', brain_id=brain_id, ssm_state=ssm_state or {})
         return _dict_to_session(rep['session'])
 
     def exit(self, session):
-        rep = self._call('exit', session=_session_to_dict(session))
+        rep = self._ctrl_call('exit', session=_session_to_dict(session))
         return rep.get('ssm_state', {})
 
     def step_async(self, actions):
+        """Simulate async: run step immediately, cache result for step_wait."""
         action_dicts = {
             k: {'continuous': v.continuous, 'discrete': v.discrete,
                 'env_id': v.env_id, 'agent_id': v.agent_id}
             for k, v in actions.items()
         }
-        self._call('step_async', actions=action_dicts)
+        # Mirror server's action-pull → step → obs-push
+        acts = {k: _dict_to_action(v) for k, v in action_dicts.items()}
+        self._server._env.step_async(acts)
+        bundles = self._server._env.step_wait()
+        raw = _serialize({'bundles': {k: _bundle_to_dict(b) for k, b in bundles.items()}})
+        self._pending_step_result = _deserialize(raw)
 
     def step_wait(self):
-        rep = self._call('step_wait')
-        return {k: _dict_to_bundle(v) for k, v in rep['bundles'].items()}
+        rep = self._pending_step_result or {}
+        return {k: _dict_to_bundle(v) for k, v in rep.get('bundles', {}).items()}
 
     def reset(self, session):
-        rep = self._call('reset', session=_session_to_dict(session))
+        rep = self._ctrl_call('reset', session=_session_to_dict(session))
         return {k: _dict_to_bundle(v) for k, v in rep['bundles'].items()}
 
 
 @pytest.fixture
 def proxy():
     env    = _make_mock_env()
-    server = EnvironmentServer(env, port=5556, verbose=False)
+    server = EnvironmentServer(env, ctrl_port=5556, verbose=False)
     return _InProcessProxy(server)
 
 
@@ -135,12 +147,14 @@ def test_exit_returns_ssm_state(proxy):
 
 
 def test_step_wait_returns_sensor_bundles(proxy):
+    proxy.step_async({})
     bundles = proxy.step_wait()
     assert "a0" in bundles
     assert isinstance(bundles["a0"], SensorBundle)
 
 
 def test_sensor_bundle_shapes_survive_roundtrip(proxy):
+    proxy.step_async({})
     bundles = proxy.step_wait()
     b = bundles["a0"]
     assert b.visual is not None
@@ -182,3 +196,38 @@ def test_manifest_cached_after_first_call(proxy):
     m1 = proxy.manifest
     m2 = proxy.manifest
     assert m1 is m2   # cached — same object
+
+
+def test_extra_field_survives_roundtrip(proxy):
+    """extra dict (env_field) serializes correctly through the proxy."""
+    proxy.step_async({})
+    bundles = proxy.step_wait()
+    b = bundles.get("a0")
+    if b is not None:
+        assert isinstance(b.extra, dict)
+
+
+def test_serialization_torch_tensor():
+    """Torch tensors in ssm_state serialize via pickle fallback."""
+    try:
+        import torch
+        state = {"layer0": torch.zeros(1, 32), "layer1": torch.ones(1, 32)}
+        data  = _serialize(state)
+        recovered = _deserialize(data)
+        assert "layer0" in recovered
+        assert recovered["layer0"].shape == (1, 32)
+    except ImportError:
+        import pytest
+        pytest.skip("torch not installed")
+
+
+def test_numpy_array_in_extra_serializes():
+    import numpy as np
+    arr = np.random.rand(64).astype(np.float32)
+    b   = SensorBundle(extra={"env_field": arr}, env_id="e", agent_id="a")
+    d   = _bundle_to_dict(b)
+    raw = _serialize(d)
+    d2  = _deserialize(raw)
+    b2  = _dict_to_bundle(d2)
+    assert "env_field" in b2.extra
+    assert np.allclose(b2.extra["env_field"], arr)

@@ -116,6 +116,11 @@ class SensorBundle:
     proprioceptive: np.ndarray = field(
         default_factory=lambda: np.zeros(0, dtype=np.float32))
 
+    # Additional manifest-defined sensors (keyed by SensorSpec.name)
+    # Use this for sensors beyond visual/audio/text/proprioceptive.
+    # Serializable through EnvironmentProxy (numpy arrays only).
+    extra:   dict  = field(default_factory=dict)
+
     # Episode metadata
     reward:  float = 0.0   # one channel, not privileged
     done:    bool  = False  # episode boundary — SSM persists across this

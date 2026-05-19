@@ -81,12 +81,20 @@ def test_step_wait_bundle_is_sensor_bundle(meta):
     assert bundles["b0"].env_id == "meta"
 
 
-def test_env_field_in_info(meta):
+def test_env_field_in_extra(meta):
+    """env_field is a manifest-declared sensor — goes in extra, not info."""
     meta.enter("b0")
     bundles = meta.step_wait()
-    info = bundles["b0"].info
-    assert "env_field" in info
-    assert info["env_field"].shape == (64,)
+    extra = bundles["b0"].extra
+    assert "env_field" in extra
+    assert extra["env_field"].shape == (64,)
+
+
+def test_info_does_not_contain_env_field(meta):
+    """info is for non-sensor metadata only."""
+    meta.enter("b0")
+    bundles = meta.step_wait()
+    assert "env_field" not in bundles["b0"].info
 
 
 def test_environment_signal_visible_in_field(meta):
