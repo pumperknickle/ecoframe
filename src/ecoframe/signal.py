@@ -118,3 +118,28 @@ class EnvironmentSignal(Signal):
     device_type:   str   = "cpu" # "cpu" | "cuda" | "mps"
     device_id:     int   = 0
     memory_gb:     float = 0.0
+
+
+@dataclass
+class BrainSignal(Signal):
+    """
+    Published by brains into the Field.
+
+    Symmetric to EnvironmentSignal — lets BrainRegistry and MetaEnvironment
+    route brains to environments and coordinate multi-brain populations.
+
+    All values are measurements (floats), never representations (tensors).
+    """
+    channels: ClassVar[dict[str, str]] = {
+        'ce_ema':    'smoothed CE loss — lower means less remaining to learn here',
+        'surprise':  'SSM state change rate — how much brain is currently surprised',
+        'steps':     'total training steps accumulated by this brain',
+        'load':      'fraction of brain capacity currently used (0–1)',
+    }
+
+    ce_ema:   float = 5.5
+    surprise: float = 0.0
+    steps:    float = 0.0
+    load:     float = 1.0   # 1.0 = fully occupied (in an env), 0.0 = idle
+    env_id:   str   = ""    # current environment ("" if between envs)
+    scale:    str   = ""    # brain scale: nano, small, medium...
