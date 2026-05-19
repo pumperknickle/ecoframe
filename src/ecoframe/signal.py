@@ -115,9 +115,39 @@ class EnvironmentSignal(Signal):
     env_type:      str   = ""    # "metadrive_roundabout", "navsim", etc.
     manifest_hash: str   = ""    # SensorManifest.hash — brain checks compatibility
     # Hardware fields — populated from HardwareSpec, used for hardware-aware routing
-    device_type:   str   = "cpu" # "cpu" | "cuda" | "mps"
-    device_id:     int   = 0
-    memory_gb:     float = 0.0
+    device_type:    str   = "cpu" # "cpu" | "cuda" | "mps"
+    device_id:      int   = 0
+    memory_gb:      float = 0.0
+    required_certs: str   = ""   # comma-separated cert names required to enter
+
+
+@dataclass
+class CertSignal(Signal):
+    """
+    Published by certification environments when a brain passes or fails.
+
+    On pass: brain earns cert_name, MetaEnvironment/BrainRegistry update
+             brain.certifications, unlocking prerequisite-gated environments.
+
+    On fail: brain must accumulate retry_after_steps of training before
+             another attempt. Rate limiting is step-based (earned training),
+             not time-based — preserves Philosophy 9 (developmental ordering).
+
+    Rate limiting: brain cannot re-attempt cert_name until it has completed
+    retry_after_steps more training steps. This prevents spamming attempts
+    before genuine mastery. The 'wait' is measured in gradient steps, not
+    wall clock time — the brain must earn the right to retry.
+    """
+    channels: ClassVar[dict[str, str]] = {
+        'passed': '1.0 = pass, 0.0 = fail',
+        'score':  'continuous performance metric [0, 1]',
+    }
+
+    passed:            float = 0.0   # 1.0 = pass, 0.0 = fail
+    score:             float = 0.0   # e.g. 1 - crash_rate
+    cert_name:         str   = ""    # "driving_basics", "roundabout_yield"
+    brain_id:          str   = ""    # which brain this cert is for
+    retry_after_steps: int   = 5000  # steps brain must train before retrying
 
 
 @dataclass
@@ -137,9 +167,10 @@ class BrainSignal(Signal):
         'load':      'fraction of brain capacity currently used (0–1)',
     }
 
-    ce_ema:   float = 5.5
-    surprise: float = 0.0
-    steps:    float = 0.0
-    load:     float = 1.0   # 1.0 = fully occupied (in an env), 0.0 = idle
-    env_id:   str   = ""    # current environment ("" if between envs)
-    scale:    str   = ""    # brain scale: nano, small, medium...
+    ce_ema:         float = 5.5
+    surprise:       float = 0.0
+    steps:          float = 0.0
+    load:           float = 1.0    # 1.0 = fully occupied, 0.0 = idle
+    env_id:         str   = ""     # current environment ("" if between envs)
+    scale:          str   = ""     # nano, small, medium...
+    certifications: str   = ""     # comma-separated earned cert names

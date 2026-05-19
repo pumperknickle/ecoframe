@@ -18,7 +18,7 @@ from ecoframe.protocol import (
     CapacityError, ManifestMismatchError,
 )
 from ecoframe.training_engine import TrainingEngine
-from ecoframe.signal import Signal, CuriositySignal, EnvironmentSignal
+from ecoframe.signal import Signal, CuriositySignal, EnvironmentSignal, BrainSignal, CertSignal
 from ecoframe.field import Field
 from ecoframe.environment import Environment
 
