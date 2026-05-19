@@ -91,10 +91,23 @@ class MetaEnvironment:
         # Known task environments (registered via register_env)
         self._known_envs: dict[str, EnvironmentProtocol] = {}
 
+        # Active task environment — when set, step_async/step_wait proxy here.
+        # None means brain is between task envs, navigating via field gradient.
+        self._active_env: EnvironmentProtocol | None = None
+
         # Per-brain state
         self._brain_pos:    dict[str, tuple[float, float]] = {}
         self._brain_ce_ema: dict[str, float]               = {}
         self._step_count = 0
+
+    # ── Manifest: switches when proxying a task env ───────────────────────────
+
+    @property
+    def manifest(self) -> SensorManifest:
+        """When proxying a task env, expose its manifest so brain encodes correctly."""
+        if self._active_env is not None:
+            return self._active_env.manifest
+        return META_MANIFEST
 
     # ── Environment registration ───────────────────────────────────────────────
 
@@ -104,7 +117,6 @@ class MetaEnvironment:
         The brain can auto-enter this env when it navigates toward it.
         """
         self._known_envs[env.env_id] = env
-        # Register env's "position" in the field
         self._field.register_agent(env.env_id, pos=(
             len(self._known_envs) * 2.0, 0.0))
 
@@ -146,18 +158,67 @@ class MetaEnvironment:
         return session.ssm_state
 
     def reset(self, session: Session) -> dict[str, SensorBundle]:
+        """
+        Return initial observations.
+        Auto-enters the first registered task env on first call — no designer
+        schedule, just 'start learning immediately if a task env is available.'
+        In the future, field gradient determines which env to enter.
+        """
+        if self._active_env is None and self._known_envs:
+            self._enter_task_env(next(iter(self._known_envs.values())), session)
+        if self._active_env is not None:
+            return self._active_env.reset(session)
         return self.step_wait()
 
+    def _enter_task_env(self, env: EnvironmentProtocol, session: Session) -> None:
+        """Enter a task env on the brain's behalf. Start it if needed."""
+        if not hasattr(env, '_started') or not env._started:
+            env.start()
+            if hasattr(env, '_started'):
+                env._started = True
+        env.enter(session.brain_id, ssm_state=session.ssm_state)
+        self._active_env = env
+        if self._verbose:
+            print(f"MetaEnv: brain entered task env '{env.env_id}'", flush=True)
+
+    def _exit_task_env(self, session: Session) -> None:
+        """Exit the current task env, carry SSM state back to meta."""
+        if self._active_env is not None:
+            from ecoframe.protocol import Session as _Session
+            task_session = _Session(
+                brain_id  = session.brain_id,
+                env_id    = self._active_env.env_id,
+                agent_id  = session.agent_id,
+                ssm_state = session.ssm_state,
+            )
+            self._active_env.exit(task_session)
+            if self._verbose:
+                print(f"MetaEnv: brain exited '{self._active_env.env_id}'", flush=True)
+            self._active_env = None
+
     def step_async(self, actions: dict[str, ActionBundle]) -> None:
-        """Apply navigation actions — move brains toward environments."""
-        self._pending_actions = actions
+        """
+        Proxy to active task env if one is running.
+        Otherwise process navigation actions in meta.
+        """
+        if self._active_env is not None:
+            self._active_env.step_async(actions)
+        else:
+            self._pending_actions = actions
 
     def step_wait(self) -> dict[str, SensorBundle]:
         """
-        Advance the meta environment one step.
-        Returns SensorBundles describing the current ecology state.
+        Proxy to active task env when one is running.
+        Otherwise return field gradient observations (brain is navigating meta).
         """
         self._step_count += 1
+
+        if self._active_env is not None:
+            bundles = self._active_env.step_wait()
+            if self._step_count % 100 == 0:
+                self._publish_env_signal(self._active_env)
+            return bundles
+
         self._field.step()
 
         actions  = getattr(self, '_pending_actions', {}) or {}
@@ -206,6 +267,44 @@ class MetaEnvironment:
 
         self._pending_actions = {}
         return bundles
+
+    # ── Signal publishing ─────────────────────────────────────────────────────
+
+    def _publish_env_signal(self, env: EnvironmentProtocol) -> None:
+        """Publish the active task env's state into the Field."""
+        curiosity = getattr(env, '_ce_ema', 5.5)
+        load      = getattr(env, '_n_active', 0) / max(1, getattr(env, 'capacity', 1))
+        hw        = getattr(env, 'hardware_spec', None)
+        sig = EnvironmentSignal(
+            position      = (2.0, 0.0),
+            timestamp     = self._step_count,
+            publisher     = env.env_id,
+            curiosity     = float(curiosity),
+            load_fraction = float(load),
+            env_type      = env.env_id,
+            manifest_hash = env.manifest.hash,
+            device_type   = hw.device_type if hw else "cpu",
+            memory_gb     = hw.memory_gb   if hw else 0.0,
+        )
+        self._field.register_agent(env.env_id, pos=(2.0, 0.0))
+        self._field.publish(env.env_id, sig)
+
+    # ── Properties ────────────────────────────────────────────────────────────
+
+    @property
+    def hardware_spec(self):
+        from ecoframe.protocol import HardwareSpec
+        return HardwareSpec.cpu()  # MetaEnvironment itself is CPU-only
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    def close(self) -> None:
+        if self._active_env is not None:
+            try:
+                self._active_env.close()
+            except Exception:
+                pass
+            self._active_env = None
 
     # ── Convenience: auto-navigate brains ─────────────────────────────────────
 
