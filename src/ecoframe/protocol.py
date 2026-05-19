@@ -193,9 +193,10 @@ class EnvironmentProtocol(Protocol):
     Owns: physics simulation, rendering, NPC models, its own CUDA context.
 
     Async step interface (step_async / step_wait) enables GPU/env overlap:
-      brain.process(obs)         # GPU forward — overlaps with env step
-      env.step_async(actions)    # send actions, don't wait
-      new_obs = env.step_wait()  # collect — env was stepping during GPU work
+      actions, loss = brain.forward(obs, manifest)  # forward + build loss
+      env.step_async(actions)                        # send fresh actions, non-blocking
+      metrics = brain.backward(loss)                 # backward overlaps env step
+      new_obs = env.step_wait()                      # collect when GPU done
     """
     env_id:   str
     capacity: int
@@ -236,16 +237,49 @@ class EnvironmentProtocol(Protocol):
         ...
 
 
+@dataclass
+class LossHandle:
+    """
+    Opaque handle returned by BrainProtocol.forward().
+
+    Carries the live loss tensor (with grad_fn) and step metadata.
+    Pass unchanged to BrainProtocol.backward().
+
+    None loss means no gradient available (first step, or train=False).
+    Implementation-defined internals — callers must not inspect _state.
+    """
+    _state: Any = None
+
+    def is_valid(self) -> bool:
+        """True if backward() will compute a real gradient."""
+        return self._state is not None
+
+
 @runtime_checkable
 class BrainProtocol(Protocol):
     """
     Long-running process with its own GPU scope.
 
-    Consumes SensorBundles, produces ActionBundles + training signal.
-    Owns: SSM state, prediction heads, optimizer, its own CUDA context.
+    Two-phase interface enables automatic CPU-GPU overlap in TrainingEngine:
 
-    The brain's SSM is never reset. It is a running compressed world model
-    accumulating since training began. enter/exit carry it between envs.
+      actions, loss = brain.forward(obs, manifest)  # forward pass + build loss (~2ms)
+      env.step_async(actions)                        # env steps on CPU (non-blocking)
+      metrics = brain.backward(loss)                 # backward overlaps env step (~3ms)
+      obs = env.step_wait()                          # collect when GPU done
+
+    Why this ordering eliminates stale actions:
+      - forward() computes fresh actions from current obs
+      - actions sent to env immediately (no staleness)
+      - backward() runs while env executes those fresh actions
+      - overlap is on backward, not forward
+
+    Why no prime() needed:
+      - first call: forward() returns LossHandle(None) — no previous h_cond
+      - backward(LossHandle(None)) is a no-op, returns empty metrics
+      - pipeline starts cleanly without caller managing init state
+
+    The brain's SSM is never reset. It accumulates since training began.
+    enter/exit carry it between environments.
     """
     brain_id: str
     sessions: dict[str, Session]
@@ -258,19 +292,32 @@ class BrainProtocol(Protocol):
         """Leave env. Brain keeps SSM state for next environment."""
         ...
 
-    def process(
+    def forward(
         self,
-        sensors:  dict[str, SensorBundle],
-        manifest: SensorManifest,
-        train:    bool = True,
-    ) -> tuple[dict[str, ActionBundle], TrainingMetrics]:
+        sensors:     dict[str, SensorBundle],
+        manifest:    SensorManifest,
+        explore_mag: float = 0.0,
+    ) -> tuple[dict[str, ActionBundle], LossHandle]:
         """
-        Core loop:
-          1. Encode sensors per manifest (world + self sensors → SSM inputs)
+        Forward pass: sensors → actions + live loss tensor.
+
+        Computes:
+          1. Encode sensors per manifest (world + self → SSM inputs)
           2. forward_stateful — persistent SSM, never reset
           3. trajectory_head + efference → actions
-          4. predict manifest.prediction_targets (CE loss on world sensors)
-          5. If train: backward + optimizer step
+          4. CE loss: prev_h_cond predicts current world sensors (no next obs needed)
+
+        Does NOT call .backward(). Returns LossHandle for caller to decide when.
+        Call backward() after env.step_async() to overlap backward with env step.
+        """
+        ...
+
+    def backward(self, loss: LossHandle) -> TrainingMetrics:
+        """
+        Backward pass: loss.backward() + optimizer.step().
+
+        No-op if loss.is_valid() is False (first step or train=False).
+        Call after env.step_async() so backward overlaps env step on CPU.
         """
         ...
 
